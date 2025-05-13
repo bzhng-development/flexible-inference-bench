@@ -1,5 +1,6 @@
 # Taken from vLLM benchmarks
 # pylint: disable=too-many-positional-arguments
+import io
 import json
 import os
 import sys
@@ -33,6 +34,9 @@ class RequestFuncInput(BaseModel):
     stream: bool = True
     cookies: Dict[str, str]
     logprobs: Optional[int] = None
+    language: Optional[str] = None
+    multi_modal_data: Optional[Dict[str, Any]] = None
+    extra_body: Optional[Dict[str, Any]] = None
 
 
 class RequestFuncOutput(BaseModel):
@@ -208,6 +212,7 @@ async def async_request_deepspeed_mii(
         # NOTE: DeepSpeed-MII doesn't support streaming as of Jan 28 2024,
         # will use 0 as placeholder.
         # See https://github.com/microsoft/DeepSpeed-MII/pull/311
+        # Lazy import without PlaceholderModule to avoid vllm dep.
         output.ttft = 0
 
         st = time.perf_counter()
@@ -388,8 +393,135 @@ async def async_request_openai_completions(
                 exc_info = sys.exc_info()
                 output.error = "".join(traceback.format_exception(*exc_info))
     if pbar:
-        pbar.update(1)
+            pbar.update(1)
     return output
+
+
+async def async_request_openai_audio(
+    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+) -> RequestFuncOutput:
+    # Lazy import without PlaceholderModule to avoid vllm dep.
+    import soundfile  # type: ignore
+    api_url = request_func_input.api_url
+    assert api_url.endswith(
+        ("transcriptions", "translations")
+    ), "OpenAI Audio API URL must end with 'transcriptions' or 'translations'."
+
+    async with aiohttp.ClientSession(trust_env=True, timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "model": request_func_input.model,
+            "temperature": 0.0,
+            # "max_completion_tokens": request_func_input.output_len, # Not applicable for audio
+            "stream": True,
+            "stream_include_usage": True,
+            "stream_continuous_usage_stats": True,
+        }
+        if request_func_input.language:
+            payload["language"] = request_func_input.language
+        else:
+            # Default to English if not specified, common for Whisper
+            payload["language"] = "en"
+
+        if request_func_input.extra_body:
+            payload.update(request_func_input.extra_body)
+
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        }
+
+        # Send audio file
+        def to_bytes(y: Any, sr: Any) -> io.BytesIO:
+            buffer = io.BytesIO()
+            soundfile.write(buffer, y, sr, format="WAV")
+            buffer.seek(0)
+            return buffer
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len # Prompt len might not be directly applicable or could be 0
+
+        generated_text = ""
+        ttft = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        latency = 0.0
+
+        if verbose:
+            print_verbose(idx, request_func_input, st, 0, 0, True)
+
+        try:
+            if request_func_input.multi_modal_data and 'audio' in request_func_input.multi_modal_data:
+                audio_data = request_func_input.multi_modal_data['audio']
+                with to_bytes(*audio_data) as f:
+                    form = aiohttp.FormData()
+                    form.add_field('file', f, content_type='audio/wav')
+                    for key, value in payload.items():
+                        form.add_field(key, str(value))
+
+                    async with session.post(url=api_url, data=form, headers=headers, verify_ssl=request_func_input.ssl) as response:
+                        if response.status == 200:
+                            async for chunk_bytes in response.content:
+                                chunk_bytes = chunk_bytes.strip()
+                                if not chunk_bytes:
+                                    continue
+
+                                chunk = chunk_bytes.decode("utf-8").removeprefix("data: ")
+                                if chunk == "[DONE]":
+                                    latency = time.perf_counter() - st
+                                    break # [DONE] is the terminal signal for stream
+
+                                timestamp = time.perf_counter()
+                                data = json.loads(chunk)
+
+                                if choices := data.get("choices"):
+                                    delta_content = choices[0].get("delta", {}).get("content")
+                                    # First token
+                                    if ttft == 0.0 and delta_content: # Ensure content is not None for first token
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
+
+                                    # Decoding phase
+                                    elif delta_content: # Ensure content is not None for subsequent tokens
+                                        output.itl.append(timestamp - most_recent_timestamp)
+                                    
+                                    if delta_content:
+                                        generated_text += delta_content
+                                
+                                elif usage := data.get("usage"):
+                                    # For audio, completion_tokens might represent something else or not be present
+                                    # output.output_len = usage.get("completion_tokens")
+                                    # prompt_tokens also might not be directly applicable
+                                    # output.prompt_len = usage.get("prompt_tokens")
+                                    pass # Process usage if needed
+
+                                most_recent_timestamp = timestamp
+                            
+                            output.generated_text = generated_text
+                            output.success = True
+                            output.latency = latency if latency > 0.0 else most_recent_timestamp - st
+
+                        else:
+                            output.error = f"Error: {response.status} {await response.text()}"
+                            output.success = False
+            else:
+                output.error = "Multi-modal data with 'audio' key not provided."
+                output.success = False
+
+        except aiohttp.ClientConnectorError:
+            output.success = False
+            output.error = "Connection error, please verify the server is running."
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+        if verbose:
+            # Ensure latency is calculated if not set by [DONE]
+            final_latency = output.latency if output.latency > 0.0 else most_recent_timestamp - st
+            print_verbose(idx, request_func_input, 0, most_recent_timestamp, final_latency, False)
+
+        if pbar:
+            pbar.update(1)
+        return output
 
 
 async def async_request_openai_chat_completions(
@@ -663,5 +795,6 @@ ASYNC_REQUEST_FUNCS = {
     "deepspeed-mii": async_request_deepspeed_mii,
     "openai": async_request_openai_completions,
     "openai-chat": async_request_openai_chat_completions,
+    "openai-audio": async_request_openai_audio,
     "tensorrt-llm": async_request_trt_llm,
 }

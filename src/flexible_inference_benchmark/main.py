@@ -7,7 +7,7 @@ import itertools
 import sys
 import os
 import time
-from typing import List, Any, Tuple, Union
+from typing import List, Any, Dict, Tuple, Union, Optional
 from concurrent.futures import ThreadPoolExecutor
 import base64
 import requests
@@ -23,7 +23,7 @@ from flexible_inference_benchmark.utils.utils import (
     set_max_open_files,
     download_sharegpt_dataset,
 )
-from flexible_inference_benchmark.engine.data import ShareGPT, Textfile, Random
+from flexible_inference_benchmark.engine.data import ShareGPT, Textfile, Random, ASRDataset, Data as EngineData # Added ASRDataset, EngineData
 from flexible_inference_benchmark.engine.client import Client
 from flexible_inference_benchmark.engine.backend_functions import ASYNC_REQUEST_FUNCS
 from flexible_inference_benchmark.engine.workloads import WORKLOADS_TYPES
@@ -160,16 +160,24 @@ def generate_request_times(args: argparse.Namespace) -> List[Union[int, float]]:
 
 def generate_prompts(
     args: argparse.Namespace, tokenizer: PreTrainedTokenizerBase, size: int
-) -> List[Tuple[str, int, int]]:
+) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]: # Updated signature
     filename = args.dataset_path
-    prompt_cls: Union[Random, Textfile, ShareGPT, None] = None
+    prompt_cls: Union[Random, Textfile, ShareGPT, ASRDataset, None] = None # Added ASRDataset
     if args.dataset_name.startswith('sharegpt'):
         logger.info(
             "User selected sharegpt dataset. "
             "Ignoring prompt and output length distribution and following the shapes from the dataset."
         )
         prompt_cls = ShareGPT(filename, tokenizer)
-    else:
+    elif args.dataset_name == "asr":
+        logger.info(
+            f"User selected ASR dataset. Using {filename}."
+        )
+        if not filename:
+            raise ValueError("dataset_path must be provided for ASR dataset.")
+        # Assuming dataset_subset and dataset_split will use defaults in ASRDataset if not provided in args
+        prompt_cls = ASRDataset(dataset_path=filename, tokenizer=tokenizer)
+    else: # random or other
         logger.info(
             f"User selected {args.dataset_name} dataset. Generating prompt and output lengths from distributions."
         )
@@ -386,7 +394,7 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
         "--dataset",
         type=str,
         default="random",
-        choices=["sharegpt", "sharegpt_code", "other", "random"],
+        choices=["sharegpt", "sharegpt_code", "other", "random", "asr"],
         help="Name of the dataset to benchmark on.",
     )
 
@@ -548,9 +556,29 @@ def run_main(args: argparse.Namespace) -> None:
     )
     tokenizer_id = args.tokenizer if args.tokenizer else args.model
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(tokenizer_id)
-    requests_prompts = generate_prompts(args, tokenizer, size)
-    min_length = min(len(requests_prompts), len(requests_times))
-    requests_prompts = requests_prompts[:min_length]
+
+    # Determine dataset class for IS_MULTIMODAL check
+    dataset_class_for_check: Optional[type[EngineData]] = None
+    if args.dataset_name == "asr":
+        dataset_class_for_check = ASRDataset
+    elif args.dataset_name.startswith("sharegpt"):
+        dataset_class_for_check = ShareGPT
+    elif args.dataset_name == "random":
+        dataset_class_for_check = Random
+    elif args.dataset_name == "other" and args.dataset_path:
+        dataset_class_for_check = Textfile
+    # Add other multimodal datasets here if they are introduced (e.g. VisionArenaDataset, ConversationDataset)
+
+    if dataset_class_for_check and dataset_class_for_check.IS_MULTIMODAL and \
+       args.backend not in ["openai-chat", "openai-audio"]:
+        raise ValueError(
+            f"Dataset '{args.dataset_name}' is multi-modal and is only supported with 'openai-chat' or 'openai-audio' backends. "
+            f"Selected backend: '{args.backend}'. Please choose a compatible backend."
+        )
+
+    requests_prompts_tuples: List[Tuple[str, int, int, Optional[Dict[str, Any]]]] = generate_prompts(args, tokenizer, size)
+    min_length = min(len(requests_prompts_tuples), len(requests_times))
+    requests_prompts_tuples = requests_prompts_tuples[:min_length]
     requests_times = requests_times[:min_length]
     requests_media = [arr_dims[:min_length] for arr_dims in requests_media]
 
@@ -580,30 +608,32 @@ def run_main(args: argparse.Namespace) -> None:
     client_verbose_value = client.verbose
     client.verbose = False
     logger.info("Sending a single request for validation.")
-    validate_endpoint = asyncio.run(client.validate_url_endpoint(requests_prompts[0], requests_media[0][0]))
+    # Validate with the first prompt tuple (which now includes multimodal data if present)
+    validate_endpoint = asyncio.run(client.validate_url_endpoint(requests_prompts_tuples[0], requests_media[0][0]))
     if not validate_endpoint.success:
-        logger.info(f"{validate_endpoint.error}.\nExiting benchmark ....")
+        logger.error(f"Endpoint validation failed: {validate_endpoint.error}.\nExiting benchmark ....") # Changed to logger.error
         sys.exit(1)
     client.verbose = client_verbose_value
-    logger.info("Beginning benchmark.")
+    logger.info("Endpoint validation successful. Beginning benchmark.") # Added success message
 
     for idx, arr_dims in enumerate(requests_media):
-        if args.num_of_imgs_per_req:
+        if args.num_of_imgs_per_req: # This part is for image multimodality, ASR is audio.
             logger.info(
                 (
                     f"Benchmarking with {args.num_of_imgs_per_req} images per request "
                     f"with ratio {args.img_ratios_per_req[idx]}"
                 )
             )
+        # For ASR, we might not have image-specific logs here, but the general benchmark proceeds.
         t = time.perf_counter()
-        output_list: List[Any] = send_requests(client, requests_prompts, requests_times, arr_dims)
+        output_list: List[Any] = send_requests(client, requests_prompts_tuples, requests_times, arr_dims) # Pass requests_prompts_tuples
         benchmark_time = time.perf_counter() - t
         # pylint: disable=line-too-long
         output = {
             "backend": args.backend,
             "time": benchmark_time,
             "outputs": [request_func_output.model_dump() for request_func_output in output_list],  # type: ignore
-            "inputs": requests_prompts,
+            "inputs": requests_prompts_tuples, # Storing the 4-tuples
             "tokenizer": args.tokenizer if args.tokenizer else args.model,
             "stream": not args.disable_stream,
         }

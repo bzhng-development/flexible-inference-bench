@@ -1,6 +1,6 @@
 # pylint: disable=too-many-positional-arguments
 import abc
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
 import logging
 import json
 import random
@@ -45,8 +45,10 @@ def hash_string(s: str) -> str:
 
 
 class Data(abc.ABC):
+    IS_MULTIMODAL: bool = False
+
     @abc.abstractmethod
-    def generate_data(self, size: int) -> List[Tuple[str, int, int]]:
+    def generate_data(self, size: int) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]:
         pass
 
 
@@ -127,16 +129,17 @@ class Textfile(Data):
             ignore_input_distribution,
         )
 
-    def generate_data(self, size: int) -> List[Tuple[str, int, int]]:
+    def generate_data(self, size: int) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]:
         # Can save memory by using a generator. However for performance we will use a list
-        input_data: List[Tuple[str, int, int]] = []
+        input_data: List[Tuple[str, int, int, Optional[Dict[str, Any]]]] = []
         lengths = self.prefill_distribution.generate_distribution(size)
         output_tokens = self.output_token_distribution.generate_distribution(size)
         starts = self.start_distribution.generate_distribution(lengths)
         prefix_len = len(self.tokenizer.encode(self.prefix_str))
 
         if self.ignore_input_distribution:
-            input_data = [(self.prefix_str, prefix_len, output_tokens[i]) for i in range(size)]
+            # Add None for the multi-modal data part of the tuple
+            input_data = [(self.prefix_str, prefix_len, output_tokens[i], None) for i in range(size)]
         else:
             for i in range(size):
                 if lengths[i] - prefix_len < 0:  # skip when sampling length less than prefix
@@ -151,6 +154,7 @@ class Textfile(Data):
                         self.prefix_str + self.tokenizer.decode(self.data[starts[i] : prompt_end]),
                         achieved_len,
                         output_tokens[i],
+                        None,  # Add None for multi-modal data
                     )
                 )
 
@@ -230,14 +234,15 @@ class Random(Data):
             ignore_input_distribution,
         )
 
-    def generate_data(self, size: int) -> List[Tuple[str, int, int]]:
-        input_data: List[Tuple[str, int, int]] = []
+    def generate_data(self, size: int) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]:
+        input_data: List[Tuple[str, int, int, Optional[Dict[str, Any]]]] = []
         lengths = self.prefill_distribution.generate_distribution(size)
         output_tokens = self.output_token_distribution.generate_distribution(size)
         prefix_len = len(self.tokenizer.encode(self.prefix_str))
 
         if self.ignore_input_distribution:
-            input_data = [(self.prefix_str, prefix_len, output_tokens[i]) for i in range(size)]
+            # Add None for the multi-modal data part of the tuple
+            input_data = [(self.prefix_str, prefix_len, output_tokens[i], None) for i in range(size)]
         else:
             for i in range(size):
                 data = list(self.token_distribution.generate_distribution(lengths[i] + self.num_trials))
@@ -247,7 +252,12 @@ class Random(Data):
                 achieved_len = prompt_end + prefix_len
 
                 input_data.append(
-                    (self.prefix_str + self.tokenizer.decode(data[:prompt_end]), achieved_len, output_tokens[i])
+                    (
+                        self.prefix_str + self.tokenizer.decode(data[:prompt_end]),
+                        achieved_len,
+                        output_tokens[i],
+                        None,  # Add None for multi-modal data
+                    )
                 )
 
         if len(input_data) < size:
@@ -303,8 +313,154 @@ class ShareGPT(Data):
 
         logger.info("Loaded ShareGPT dataset.")
 
-    def generate_data(self, size: int) -> List[Tuple[str, int, int]]:
+    def generate_data(self, size: int) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]:
+        sampled_data = []
         if len(self.data) < size:
             logger.debug(f"Generating {len(self.data)} requests instead of {size} requests.")
-            return self.data
-        return random.sample(self.data, size)
+            sampled_data = self.data
+        else:
+            sampled_data = random.sample(self.data, size)
+        
+        # Add None for the multi-modal data part of the tuple
+        return [(prompt, p_len, o_len, None) for prompt, p_len, o_len in sampled_data]
+
+
+# -----------------------------------------------------------------------------
+# ASR Dataset Implementation
+# -----------------------------------------------------------------------------
+class ASRDataset(Data):
+    """
+    Dataset class for processing a ASR dataset for transcription.
+    Tested on the following set:
+
+    +----------------+----------------------------------------+--------------------------+-----------------------------+
+    | Dataset        | Domain                                 | Speaking Style           | hf-subset                   |
+    +----------------+----------------------------------------+--------------------------+-----------------------------+
+    | TED-LIUM       | TED talks                              | Oratory                  | release1, release2, release3|
+    |                |                                        |                          | release3-speaker-adaptation |
+    | VoxPopuli      | European Parliament                    | Oratory                  | en, de, it, fr,  ...        |
+    | LibriSpeech    | Audiobook                              | Narrated                 | "LIUM/tedlium"              | # Note: Original patch had "openslr/librispeech_asr" here
+    | GigaSpeech     | Audiobook, podcast, YouTube            | Narrated, spontaneous    | xs, s, m, l, xl, dev, test  |
+    | SPGISpeech     | Financial meetings                     | Oratory, spontaneous     | S, M, L, dev, test          |
+    | AMI            | Meetings                               | Spontaneous              | ihm, sdm                    |
+    +----------------+----------------------------------------+--------------------------+-----------------------------+
+
+    """  # noqa: E501
+    IS_MULTIMODAL = True
+    SUPPORTED_DATASET_PATHS = {
+        "openslr/librispeech_asr", "facebook/voxpopuli", "LIUM/tedlium",
+        "edinburghcstr/ami", "speechcolab/gigaspeech", "kensho/spgispeech"
+    }
+
+    DEFAULT_OUTPUT_LEN = 128  # As per patch 4/6
+    # TODO Whisper-specific. Abstract interface when more models are supported.
+    TRANSCRIPTION_PREAMBLE = "<|startoftranscript|><|en|><|transcribe|>"\
+                              "<|notimestamps|>"
+    skip_long_audios: bool = True
+
+    def __init__(
+        self,
+        dataset_path: str,
+        tokenizer: PreTrainedTokenizerBase,
+        dataset_subset: Optional[str] = None,
+        dataset_split: Optional[str] = "train", # Default to train as in patch
+    ):
+        from datasets import load_dataset  # type: ignore[attr-defined]
+        self.tokenizer = tokenizer
+        self.dataset_path = dataset_path
+        self.dataset_subset = dataset_subset
+        self.dataset_split = dataset_split
+
+        logger.info(
+            f"Loading ASR dataset: {dataset_path}"
+            f"{f' (subset: {dataset_subset})' if dataset_subset else ''}"
+            f"{f' (split: {dataset_split})' if dataset_split else ''}"
+        )
+        try:
+            self.data = load_dataset(dataset_path, name=dataset_subset, split=dataset_split, trust_remote_code=True)
+            logger.info(f"Successfully loaded ASR dataset. Number of samples: {len(self.data)}")
+        except Exception as e:
+            logger.error(f"Failed to load dataset {dataset_path}: {e}")
+            # Fallback to an empty list or raise error, depending on desired behavior
+            self.data = []
+            raise  # Or handle more gracefully
+
+    def generate_data(self, size: int) -> List[Tuple[str, int, int, Optional[Dict[str, Any]]]]:
+        import librosa # type: ignore
+        
+        # Use the DEFAULT_OUTPUT_LEN from class attribute
+        output_len = self.DEFAULT_OUTPUT_LEN
+        
+        prompt = ASRDataset.TRANSCRIPTION_PREAMBLE
+        # Ensure tokenizer is available and prompt is not empty before tokenizing
+        prompt_len = len(self.tokenizer.encode(prompt)) if self.tokenizer and prompt else 0
+
+        sampled_requests: List[Tuple[str, int, int, Optional[Dict[str, Any]]]] = []
+        skipped = 0
+
+        if not self.data:
+            logger.warning(f"ASR dataset {self.dataset_path} is empty or failed to load. Returning no requests.")
+            return []
+
+        # Ensure we don't try to sample more than available, or handle it by repeating/erroring
+        num_to_sample = min(size, len(self.data))
+        
+        # Simple iteration for now, consider random sampling if `size` is much smaller than `len(self.data)`
+        dataset_iterator = iter(self.data)
+
+        for _ in range(num_to_sample):
+            try:
+                item = next(dataset_iterator)
+            except StopIteration:
+                logger.warning("Reached end of dataset sooner than expected.")
+                break # No more items to sample
+
+            # output_len = len(self.tokenizer._normalize(item['text'])) # Commented out as per patch 4/6
+            
+            audio_field = item.get("audio")
+            if not audio_field or not isinstance(audio_field, dict):
+                logger.warning(f"Skipping item due to missing or invalid 'audio' field: {item}")
+                skipped +=1
+                continue
+
+            y, sr = audio_field.get("array"), audio_field.get("sampling_rate")
+            if y is None or sr is None:
+                logger.warning(f"Skipping item due to missing 'array' or 'sampling_rate' in audio field: {item}")
+                skipped +=1
+                continue
+            
+            # Ensure y is numpy array or compatible for librosa
+            # y = np.asarray(y) # If needed, ensure numpy is imported
+
+            duration_s = librosa.get_duration(y=y, sr=sr)
+            # Whisper max supported duration
+            if self.skip_long_audios and duration_s > 30:
+                skipped += 1
+                continue
+
+            mm_content = {"audio": (y, sr)}
+            sampled_requests.append(
+                (
+                    prompt,
+                    prompt_len,
+                    output_len, # Use fixed DEFAULT_OUTPUT_LEN
+                    mm_content,
+                )
+            )
+        
+        if skipped > 0:
+            logger.warning(
+                f"{skipped} samples discarded from dataset {self.dataset_path} "
+                "due to their length being greater than what Whisper supports or missing audio data."
+            )
+        
+        # If fewer requests were generated than `size` due to filtering or small dataset,
+        # the caller should handle this. Oversampling logic from patch is omitted.
+        if len(sampled_requests) < size:
+            logger.warning(
+                f"Generated {len(sampled_requests)} requests for ASR, "
+                f"but {size} were requested. Dataset might be too small or many samples were filtered."
+            )
+            # Potentially repeat samples if oversampling is desired, but patch omitted it too.
+
+        return sampled_requests
